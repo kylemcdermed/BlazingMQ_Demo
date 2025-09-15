@@ -24,7 +24,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 BROKER_URI = "tcp://localhost:30114"
 QUEUE_URI = "bmq://bmq.test.persistent.priority/india_stocks_orders"
 
-# Ensure local connection
 def is_localhost_connection(uri):
     host = uri.split("://")[1].split(":")[0]
     return host in ("localhost", "127.0.0.1")
@@ -71,7 +70,19 @@ def connect_with_retry(factory, max_retries=MAX_RETRIES, delay=RETRY_DELAY):
 # -------------------
 def producer():
     def create_session():
-        return blazingmq.Session(on_session_event=blazingmq.session_events.log_session_event)
+        session_events = []
+        def log_session_event(event):
+            event_data = {
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "event": str(event),
+                "details": getattr(event, "details", None)
+            }
+            session_events.append(event_data)
+            logging.info(f"Session event: {event_data}")
+        
+        session = blazingmq.Session(on_session_event=log_session_event)
+        session._events = session_events  # Store events for later saving
+        return session
 
     message_times = []
     message_symbols = []
@@ -83,8 +94,7 @@ def producer():
 
         for i in range(NUM_MESSAGES):
             symbol = random.choice(STOCK_SYMBOLS)
-            base_price = PRICE_MAP[symbol]
-            price = base_price + random.randint(-PRICE_VARIANCE, PRICE_VARIANCE)
+            price = PRICE_MAP[symbol] + random.randint(-PRICE_VARIANCE, PRICE_VARIANCE)
             order = {
                 "type": "BUY_ORDER",
                 "symbol": symbol,
@@ -100,17 +110,22 @@ def producer():
             message_times.append(latency)
             message_symbols.append(symbol)
             sent_orders.append(order)
-            logging.info(f"Posted: {order} | Latency: {latency:.4f}s")
+            logging.info(f"Posted: {order} | Latency: {latency*1000:.2f}ms")
             time.sleep(0.5)
 
         session.close_queue(QUEUE_URI)
         
-        # Save sent orders to JSON
+        # Save session events
+        with open("blazingmq_session_events.json", "w") as f:
+            json.dump(session._events, f, indent=2)
+        logging.info("Saved session events to blazingmq_session_events.json")
+        
+        # Save sent orders
         with open("sent_orders.json", "w") as f:
             json.dump(sent_orders, f, indent=2)
         logging.info("Saved sent orders to sent_orders.json")
         
-        return message_times, message_symbols, sent_orders
+        return message_times, message_symbols, sent_orders, session._events
 
 # -------------------
 # Consumer
@@ -129,10 +144,20 @@ def on_message(msg, handle):
 
 def consumer():
     def create_session():
-        return blazingmq.Session(
-            on_session_event=blazingmq.session_events.log_session_event,
-            on_message=on_message
-        )
+        session_events = []
+        def log_session_event(event):
+            event_data = {
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "event": str(event),
+                "details": getattr(event, "details", None)
+            }
+            session_events.append(event_data)
+            logging.info(f"Session event: {event_data}")
+        
+        session = blazingmq.Session(on_session_event=log_session_event)
+        session._events = session_events
+        return session
+
     with connect_with_retry(create_session) as session:
         logging.info("Consumer session established.")
         session.open_queue(
@@ -149,13 +174,20 @@ def consumer():
         while not stop_event.is_set():
             time.sleep(1)
         session.close_queue(QUEUE_URI)
+        
+        # Save session events
+        with open("blazingmq_session_events.json", "a") as f:
+            json.dump(session._events, f, indent=2)
+            f.write("\n")
+        logging.info("Appended consumer session events to blazingmq_session_events.json")
 
 # -------------------
 # Run consumer and producer
 # -------------------
 if __name__ == "__main__":
-    # Clear received orders file
+    # Clear received orders and session events files
     open("received_orders.json", "w").close()
+    open("blazingmq_session_events.json", "w").close()
     
     # Start consumer thread
     consumer_thread = threading.Thread(target=consumer, daemon=True)
@@ -164,10 +196,10 @@ if __name__ == "__main__":
 
     # Run producer
     try:
-        message_times, message_symbols, sent_orders = producer()
+        message_times, message_symbols, sent_orders, producer_events = producer()
     except Exception as e:
         logging.error(f"Producer failed: {e}")
-        message_times, message_symbols, sent_orders = [], [], []
+        message_times, message_symbols, sent_orders, producer_events = [], [], [], []
 
     # Wait for consumer to process messages
     time.sleep(2)
@@ -191,106 +223,145 @@ if __name__ == "__main__":
         logging.info(f"Latency stats: {stats}")
 
     # -------------------
-    # Plotting (all graphs in one figure)
+    # Plotting
     # -------------------
     if plt and message_times:
-        # Color map for symbols
+        # Color map and markers
         color_map = {"RELIANCE": "#1f77b4", "HDFCBANK": "#ff7f0e", "TCS": "#2ca02c"}
+        markers = {"RELIANCE": "o", "HDFCBANK": "s", "TCS": "^"}
         colors = [color_map[s] for s in message_symbols]
 
-        # Single figure with subplots
-        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 12), sharex=False)
+        # Combined figure
+        fig, (ax1, ax2, ax3, ax4) = plt.subplots(4, 1, figsize=(12, 16), sharex=False)
         fig.suptitle("BlazingMQ Trading Desk Performance Metrics", fontsize=16)
 
-        # 1️⃣ Bar plot
-        ax1.bar(range(1, len(message_times) + 1), [t * 1000 for t in message_times], color=colors, alpha=0.7)
-        mean_latency = np.mean(message_times) * 1000
-        ax1.axhline(mean_latency, color='red', linestyle='--', label=f'Mean Latency: {mean_latency:.2f}ms')
-        for idx, latency in enumerate(message_times):
-            ax1.text(idx + 1, latency * 1000 + 0.01, f"{latency*1000:.2f}", ha='center', va='bottom', fontsize=8)
+        # 1️⃣ Line plot with per-symbol markers
+        for i, (lat, sym) in enumerate(zip(message_times, message_symbols)):
+            ax1.plot(i + 1, lat * 1000, marker=markers[sym], color=color_map[sym],
+                     label=sym if i == 0 or sym != message_symbols[i-1] else "")
+            ax1.text(i + 1, lat * 1000 + max(lat * 1000 * 0.05, 0.01), f"{lat*1000:.2f}",
+                     ha='center', va='bottom', fontsize=8)
         ax1.set_xlabel("Message Number")
         ax1.set_ylabel("Time to Post (ms)")
-        ax1.set_title("Message Posting Latency")
-        ax1.grid(True, axis='y', linestyle='--', alpha=0.7)
+        ax1.set_title("Message Posting Latency (Per-Symbol)")
+        ax1.grid(True, ls="--", alpha=0.7)
         ax1.legend()
 
-        # 2️⃣ Histogram
-        ax2.hist([t * 1000 for t in message_times], bins=min(5, len(message_times)), color='skyblue', edgecolor='black')
-        ax2.set_xlabel("Latency (ms)")
-        ax2.set_ylabel("Frequency")
-        ax2.set_title("Latency Distribution")
-        ax2.grid(True, linestyle='--', alpha=0.7)
+        # 2️⃣ Bar plot
+        ax2.bar(range(1, len(message_times) + 1), [t * 1000 for t in message_times],
+                color=colors, alpha=0.7)
+        mean_latency = np.mean(message_times) * 1000
+        ax2.axhline(mean_latency, color='red', linestyle='--', label=f'Mean Latency: {mean_latency:.2f}ms')
+        for idx, lat in enumerate(message_times):
+            ax2.text(idx + 1, lat * 1000 + max(lat * 1000 * 0.05, 0.01), f"{lat*1000:.2f}",
+                     ha='center', va='bottom', fontsize=8)
+        ax2.set_xlabel("Message Number")
+        ax2.set_ylabel("Time to Post (ms)")
+        ax2.set_title("Message Latencies")
+        ax2.grid(True, axis='y', ls='--', alpha=0.7)
+        ax2.legend()
 
-        # 3️⃣ Cumulative latency plot
-        ax3.plot(range(1, len(message_times) + 1), np.cumsum([t * 1000 for t in message_times]), marker='o', linestyle='-', color='purple')
-        ax3.set_xlabel("Message Number")
-        ax3.set_ylabel("Cumulative Latency (ms)")
-        ax3.set_title("Cumulative Message Posting Latency")
-        ax3.grid(True, linestyle='--', alpha=0.7)
+        # 3️⃣ Histogram
+        bins = np.histogram_bin_edges([t * 1000 for t in message_times], bins='auto')
+        ax3.hist([t * 1000 for t in message_times], bins=bins, color='skyblue', edgecolor='black')
+        ax3.set_xlabel("Latency (ms)")
+        ax3.set_ylabel("Frequency")
+        ax3.set_title("Latency Distribution")
+        ax3.grid(True, ls='--', alpha=0.7)
+
+        # 4️⃣ Cumulative latency
+        ax4.plot(range(1, len(message_times) + 1), np.cumsum([t * 1000 for t in message_times]),
+                 marker='o', linestyle='-', color='purple')
+        ax4.set_xlabel("Message Number")
+        ax4.set_ylabel("Cumulative Latency (ms)")
+        ax4.set_title("Cumulative Message Posting Latency")
+        ax4.grid(True, ls='--', alpha=0.7)
 
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.savefig("blazingmq_combined_plots.png", dpi=300)
         plt.show()
 
         # Save individual plots
-        # Bar plot
-        fig1 = plt.figure(figsize=(12, 6))
-        plt.bar(range(1, len(message_times) + 1), [t * 1000 for t in message_times], color=colors, alpha=0.7)
-        plt.axhline(mean_latency, color='red', linestyle='--', label=f'Mean Latency: {mean_latency:.2f}ms')
-        for idx, latency in enumerate(message_times):
-            plt.text(idx + 1, latency * 1000 + 0.01, f"{latency*1000:.2f}", ha='center', va='bottom', fontsize=8)
+        # Line plot
+        fig1 = plt.figure(figsize=(12, 5))
+        for i, (lat, sym) in enumerate(zip(message_times, message_symbols)):
+            plt.plot(i + 1, lat * 1000, marker=markers[sym], color=color_map[sym],
+                     label=sym if i == 0 or sym != message_symbols[i-1] else "")
+            plt.text(i + 1, lat * 1000 + max(lat * 1000 * 0.05, 0.01), f"{lat*1000:.2f}",
+                     ha='center', va='bottom', fontsize=8)
         plt.xlabel("Message Number")
         plt.ylabel("Time to Post (ms)")
-        plt.title("BlazingMQ Message Posting Latency")
-        plt.grid(True, axis='y', linestyle='--', alpha=0.7)
+        plt.title("BlazingMQ Message Posting Latency (Per-Symbol)")
+        plt.grid(True, ls="--", alpha=0.7)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig("blazingmq_latency_line.png", dpi=300)
+        plt.close(fig1)
+
+        # Bar plot
+        fig2 = plt.figure(figsize=(12, 5))
+        plt.bar(range(1, len(message_times) + 1), [t * 1000 for t in message_times],
+                color=colors, alpha=0.7)
+        plt.axhline(mean_latency, color='red', linestyle='--', label=f'Mean Latency: {mean_latency:.2f}ms')
+        for idx, lat in enumerate(message_times):
+            plt.text(idx + 1, lat * 1000 + max(lat * 1000 * 0.05, 0.01), f"{lat*1000:.2f}",
+                     ha='center', va='bottom', fontsize=8)
+        plt.xlabel("Message Number")
+        plt.ylabel("Time to Post (ms)")
+        plt.title("BlazingMQ Message Latencies")
+        plt.grid(True, axis='y', ls='--', alpha=0.7)
         plt.legend()
         plt.tight_layout()
         plt.savefig("blazingmq_latency_bar.png", dpi=300)
-        plt.close(fig1)
+        plt.close(fig2)
 
         # Histogram
-        fig2 = plt.figure(figsize=(8, 4))
-        plt.hist([t * 1000 for t in message_times], bins=min(5, len(message_times)), color='skyblue', edgecolor='black')
+        fig3 = plt.figure(figsize=(8, 4))
+        plt.hist([t * 1000 for t in message_times], bins=bins, color='skyblue', edgecolor='black')
         plt.xlabel("Latency (ms)")
         plt.ylabel("Frequency")
         plt.title("BlazingMQ Latency Distribution Histogram")
-        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.grid(True, ls='--', alpha=0.7)
         plt.tight_layout()
         plt.savefig("blazingmq_latency_hist.png", dpi=300)
-        plt.close(fig2)
+        plt.close(fig3)
 
         # Cumulative latency
-        fig3 = plt.figure(figsize=(10, 4))
-        plt.plot(range(1, len(message_times) + 1), np.cumsum([t * 1000 for t in message_times]), marker='o', linestyle='-', color='purple')
+        fig4 = plt.figure(figsize=(10, 4))
+        plt.plot(range(1, len(message_times) + 1), np.cumsum([t * 1000 for t in message_times]),
+                 marker='o', linestyle='-', color='purple')
         plt.xlabel("Message Number")
         plt.ylabel("Cumulative Latency (ms)")
         plt.title("BlazingMQ Cumulative Message Posting Latency")
-        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.grid(True, ls='--', alpha=0.7)
         plt.tight_layout()
         plt.savefig("blazingmq_cumulative_latency.png", dpi=300)
-        plt.close(fig3)
+        plt.close(fig4)
 
     # -------------------
-    # Chart.js config for web
+    # Chart.js config
     # -------------------
     chartjs_config = {
-        "type": "bar",
+        "type": "line",
         "data": {
             "labels": list(range(1, len(message_times) + 1)),
             "datasets": [{
                 "label": "Message Posting Latency",
                 "data": [t * 1000 for t in message_times],
-                "backgroundColor": colors,
                 "borderColor": colors,
-                "borderWidth": 1,
-                "opacity": 0.7
+                "backgroundColor": [f"{c}80" for c in colors],  # Add alpha for points
+                "fill": False,
+                "tension": 0.1,
+                "pointStyle": [markers[s] for s in message_symbols],
+                "pointRadius": 5,
+                "pointHoverRadius": 8
             }]
         },
         "options": {
             "responsive": True,
             "plugins": {
-                "title": {"display": True, "text": "BlazingMQ Message Posting Latency"},
-                "legend": {"display": True}
+                "title": {"display": True, "text": "BlazingMQ Message Posting Latency (Per-Symbol)"},
+                "legend": {"display": False}
             },
             "scales": {
                 "x": {"title": {"display": True, "text": "Message Number"}},
