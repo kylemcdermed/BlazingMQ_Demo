@@ -10,6 +10,7 @@ import signal
 import logging
 import json
 import matplotlib.pyplot as plt
+import numpy as np
 
 # -------------------
 # Logging
@@ -69,6 +70,7 @@ def producer():
         return blazingmq.Session(on_session_event=blazingmq.session_events.log_session_event)
 
     message_times = []
+    message_symbols = []
     with connect_with_retry(create_session) as session:
         logging.info("Producer connected.")
         session.open_queue(QUEUE_URI, read=False, write=True, options=blazingmq.QueueOptions())
@@ -88,12 +90,14 @@ def producer():
             payload = json.dumps(order).encode()
             start_time = time.time()
             session.post(QUEUE_URI, payload)
-            message_times.append(time.time() - start_time)
-            logging.info(f"Posted: {order}")
+            latency = time.time() - start_time
+            message_times.append(latency)
+            message_symbols.append(symbol)
+            logging.info(f"Posted: {order} | Latency: {latency:.4f}s")
             time.sleep(0.5)
 
         session.close_queue(QUEUE_URI)
-    return message_times
+    return message_times, message_symbols
 
 # -------------------
 # Consumer
@@ -133,7 +137,7 @@ time.sleep(1)
 # -------------------
 # Run producer
 # -------------------
-message_times = producer()
+message_times, message_symbols = producer()
 time.sleep(2)
 stop_event.set()
 consumer_thread.join()
@@ -141,13 +145,45 @@ consumer_thread.join()
 logging.info("Finished all operations.")
 
 # -------------------
-# Plot latency
+# Enhanced plotting
 # -------------------
-plt.figure(figsize=(8, 4))
-plt.plot(range(1, len(message_times) + 1), message_times, marker='o', linestyle='-', color='#1f77b4')
-plt.xlabel("Message Number")
-plt.ylabel("Time to Post (seconds)")
-plt.title("BlazingMQ Message Posting Latency")
-plt.grid(True)
-plt.tight_layout()
+
+# Color map for symbols
+color_map = {"RELIANCE": "#1f77b4", "HDFCBANK": "#ff7f0e", "TCS": "#2ca02c"}
+colors = [color_map[s] for s in message_symbols]
+
+# 1️⃣ Bar plot
+fig1, ax1 = plt.subplots(figsize=(12,6))
+ax1.bar(range(1, len(message_times)+1), message_times, color=colors, alpha=0.7)
+mean_latency = np.mean(message_times)
+ax1.axhline(mean_latency, color='red', linestyle='--', label=f'Mean Latency: {mean_latency:.4f}s')
+
+for idx, latency in enumerate(message_times):
+    ax1.text(idx+1, latency + 0.01, f"{latency:.3f}", ha='center', va='bottom', fontsize=8)
+
+ax1.set_xlabel("Message Number")
+ax1.set_ylabel("Time to Post (seconds)")
+ax1.set_title("BlazingMQ Message Posting Latency")
+ax1.grid(True, axis='y', linestyle='--', alpha=0.7)
+ax1.legend()
+fig1.tight_layout()
+
+# 2️⃣ Histogram
+fig2, ax2 = plt.subplots(figsize=(8,4))
+ax2.hist(message_times, bins=min(5, len(message_times)), color='skyblue', edgecolor='black')
+ax2.set_xlabel("Latency (s)")
+ax2.set_ylabel("Frequency")
+ax2.set_title("Latency Distribution Histogram")
+ax2.grid(True, linestyle='--', alpha=0.7)
+fig2.tight_layout()
+
+# 3️⃣ Optional: Cumulative latency plot
+fig3, ax3 = plt.subplots(figsize=(10,4))
+ax3.plot(np.cumsum(message_times), marker='o', linestyle='-', color='purple')
+ax3.set_xlabel("Message Number")
+ax3.set_ylabel("Cumulative Latency (s)")
+ax3.set_title("Cumulative BlazingMQ Message Posting Latency")
+ax3.grid(True, linestyle='--', alpha=0.7)
+fig3.tight_layout()
+
 plt.show()
